@@ -1,2 +1,2 @@
-# Sistema-de-prediccion-de-la-calidad-del-aire-utilizando-la-red-de-sensores-ciudadanos-cient-ficos-me
+# Sistema de predicción de la calidad del aire utilizando la red de sensores ciudadanos científicos mediante técnicas de inteligencia artificial
 El presente repositorio contiene el producto obtenido en laboratorio de investigación: Sistema de predicción de la calidad del aire utilizando la red de sensores ciudadanos científicos mediante técnicas de inteligencia artificial, elaborado por el estudiante de Tecnología en Electrónica del Instituto Tecnológico Metropolitano Juan Diego Gallego Villada, bajo la asesoría y tutoría de los profesores Juan David Martínez Vargas y Andrés Felipe Giraldo Forero.
