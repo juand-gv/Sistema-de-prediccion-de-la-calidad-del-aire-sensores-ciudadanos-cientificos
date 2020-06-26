@@ -1,0 +1,292 @@
+#Se importan los diferentes modulos y paquetes de librerías que se usarán posteriormente
+
+import pandas as pd
+import numpy as np
+from matplotlib import pyplot as plt
+from sklearn.preprocessing import MinMaxScaler
+from sklearn.model_selection import train_test_split
+import torch.nn.functional as F
+import tqdm
+import torch
+import torch.nn as nn
+from torch.utils.data import TensorDataset, DataLoader
+
+from sklearn import metrics
+
+
+
+#Se lee el DataSet Aire.csv usando pandas.
+
+df = pd.read_csv('../input/pm25-2018-missingdata/Aire.csv')
+df.info()
+
+#Se le da un nombre a la columna de Sensores (solo por formato)
+df=df.rename(columns={'Unnamed: 0':'Sensores'})
+df = df.astype({"Sensores": str})
+
+df.head()
+
+
+#Selección de datos para predicción con datos anteriores del sensor objetivo.
+
+X = df.iloc[22,1:].values.T
+
+X = np.expand_dims(X,1)
+
+
+#Selección de datos para predicción con datos de todos los sensores de la red.
+
+X = df.iloc[:,1:].values.T
+
+
+#Selección de datos para predicción con datos de los sensores vecinos del sensor objetivo.
+
+X = df.iloc[[22,58,93,92,4],1:].values.T
+
+
+#Conversión de datos a tipo float64.
+
+X.astype("float64")
+print("X Shape: ", X.shape, "\nX type:", type(X))
+
+
+#Selección del porcentaje de datos que se usarán para el entrenamiento (95.9%) y la validación (4.1%).
+
+Xtrain, Xtest = train_test_split(X, train_size = 0.959, test_size = 0.041,
+                                 shuffle = False)
+Xtr, Xval = train_test_split(Xtrain,train_size=0.959, test_size=0.041,
+                             shuffle=False)
+print(Xtrain.shape, Xtest.shape)
+print(Xtr.shape, Xval.shape)
+
+
+
+#Índice del sensor al que se le busca hacer la predicción. 
+#Como se explica en la metodología; este índice varía según la forma en como se esté haciendo la predicción:
+
+#    Si se desea predecir a partir de las mediciones de la red completa se usa la posición del sensor en la base de datos (22).
+#    Si se desea predecir a partir de los datos del propio sensor, se usa el número cero, ya que este será el único sensor que reciba la red.
+#    Si se desea predecir a partir de los datos de los sensores vecinos, 
+#        entonces se usará la posición en la que se encuentre el sensor objetivo en el vector de sensores de entrada.
+
+sensor_idx = 0
+
+
+#Normalización de los datos usando MinMaxScaler. Esto es reescalar los datos al rango de 0 a 1 ya que las LSTMs son sensibles a la escala del input.
+
+scal_tr = MinMaxScaler()
+scal_tr.fit(Xtr[:,sensor_idx].reshape(-1,1))
+
+scal = MinMaxScaler()
+Xtr = scal.fit_transform(Xtr)
+Xval = scal.transform(Xval)
+Xtest = scal.transform(Xtest)
+
+
+
+
+#Se define la funcipon create_sequences, la cual tiene como parámetros de entrada la matriz de sensores 
+#(matrix), el índice del sensor objetivo (targ_index) y los puntos de la ventana deslizante hacia el pasado (Time_Steps). 
+#Dicha función retorna una secuencia de 5 (en este caso) datos anteriores y una etiqueta del valor real que el modelo debería predecir.
+
+def create_sequences(matrix, targ_index, Time_Steps):
+    
+    dim_0 = matrix.shape[0] - Time_Steps
+    dim_1 = matrix.shape[1]
+    
+    x = np.zeros((dim_0, Time_Steps,dim_1))
+    y = np.zeros((dim_0,1))
+    
+    for i in tqdm.notebook.tqdm(range(dim_0)):
+        
+        aux = matrix[i : Time_Steps + i, :]
+        x[i,:,:] = aux
+        y[i,:] = matrix[Time_Steps+i, targ_index]
+        
+    print("length of time-series i/o",x.shape,y.shape)
+    
+    return x, y
+
+
+#Se establece el Time_Steps como y se crean las series de tiempo usando la función create_sequences.
+
+tw = 5 
+
+Xtr, ytr = create_sequences(Xtr, sensor_idx,tw)
+Xval, yval = create_sequences(Xval, sensor_idx,tw)
+Xtest, ytest = create_sequences(Xtest, sensor_idx,tw)
+
+
+#Creación de paquetes de entrenamiento (train_loader) y de validación (val_loader).
+
+batch_size = 24
+
+train_data = TensorDataset(torch.from_numpy(Xtr), torch.from_numpy(ytr))
+train_loader = DataLoader(train_data, shuffle = True, batch_size = batch_size,
+                         drop_last = True)
+
+val_data = TensorDataset(torch.from_numpy(Xval), torch.from_numpy(yval))
+val_loader = DataLoader(val_data, shuffle = True, batch_size = batch_size,
+                       drop_last = True)
+
+
+#Se hace uso de una GPU si se dispone de ella, de lo contrario se usará la CPU.
+
+# torch.cuda.is_available() Comprueba si es posible usar GPU; Si es posible retorna True, de lo contrario retorna False.
+is_cuda = torch.cuda.is_available()
+
+
+if is_cuda:
+    device = torch.device("cuda")
+else:
+    device = torch.device("cpu")
+    
+    
+#Se define la arquitectura de la red LSTM como tal.
+
+class LSTMNet(nn.Module):
+    def __init__(self, input_dim, hidden_dim, output_dim, n_layers, drop_prob=0.2):
+        super(LSTMNet, self).__init__()
+        self.hidden_dim = hidden_dim
+        self.n_layers = n_layers
+        
+        self.lstm = nn.LSTM(input_dim, hidden_dim, n_layers, batch_first=True, dropout=drop_prob)
+        self.fc = nn.Linear(hidden_dim, output_dim)
+        self.relu = nn.ReLU()
+        
+    def forward(self, x, h):
+        out, h = self.lstm(x, h)
+        out = self.fc(self.relu(out[:,-1]))
+        return out, h
+    
+    def init_hidden(self, batch_size):
+        weight = next(self.parameters()).data
+        hidden = (weight.new(self.n_layers, batch_size, self.hidden_dim).zero_().to(device),
+                  weight.new(self.n_layers, batch_size, self.hidden_dim).zero_().to(device))
+        return hidden
+
+
+
+#Se establecen algunas carácteristicas de la red LSTM y se establece como modelo dicha red.
+
+n_features = Xtr.shape[2] # Carácterísticas que se usarán para la predicción. En este caso es la cantidad de sensores que se usan en la predicción.
+n_timesteps = tw # Es el número del "Time_Steps".
+hidden_dim = 256
+output_dim = 1 # Se desea predecir las mediciones para un solo sensor.
+n_layers = 2
+
+
+model = LSTMNet(n_features,hidden_dim,output_dim,n_layers)
+model.to(device)
+
+criterion = torch.nn.MSELoss() 
+optimizer = torch.optim.Adam(model.parameters(), lr=0.001)
+
+train_episodes = 60
+
+
+#Se entrena el modelo previamente creado.
+
+model.train()
+for t in range(train_episodes):
+    htr = model.init_hidden(batch_size)
+    for x,y in train_loader:
+        htr = tuple([e.data for e in htr])
+        model.zero_grad()
+        output, htr = model(x.to(device).float(),htr) 
+        loss = criterion(output, y.to(device).float())  
+        #Calcular gradiente
+        loss.backward() 
+        #Mover los datos
+        optimizer.step()        
+        
+    hval = model.init_hidden(batch_size)    
+    for xval,yval in val_loader:
+        hval = tuple([e.data for e in hval])
+        output_val, hval = model(xval.to(device).float(),htr) 
+        loss_val = criterion(output_val, yval.to(device).float()) 
+        
+    print('step : ' , t , ' loss_train: ' , loss.item(), ' loss_val: ', loss_val.item())
+
+
+#Se evalúan las predicciones (out) contra los datos reales (ytest).
+
+model.eval()
+Xtest = torch.from_numpy(Xtest)
+htest = model.init_hidden(Xtest.shape[0])
+out, htest = model(Xtest.to(device).float(), htest)
+
+out = out.cpu().detach().numpy()
+
+out = scal_tr.inverse_transform(out)
+ytest = scal_tr.inverse_transform(ytest)
+
+
+#Se grafican los resultados
+fig = plt.figure()
+
+ax11 = fig.add_subplot(211)
+ax11.plot(ytest, 'r', label='Real')
+
+ax11.set_title('Mediciones reales vs Mediciones predichas ',fontweight='bold')
+ax11.set_ylabel('PM2.5 [ug/m^3]')
+ax11.set_xlabel('Tiempo [h]')
+ax11.plot(out, label='Predicción')
+ax11.legend(loc=(0,0))
+plt.grid()
+#plt.savefig('Prediccion_vecinos.pdf')
+
+plt.show()
+
+
+
+#Se comprueba que en los datos reales hay 3 valores faltantes
+
+print(ytest[[299,300,354]])
+
+
+#Se eliminan dichos datos para poder hacer un buen cálculo del error
+
+ytest_f = np.delete(ytest,[299,300,354])
+out_f = np.delete(out, [299,300,354])
+
+
+#MAE (Mean Absolute Error)
+
+from sklearn.metrics import mean_absolute_error
+#Best value is 0.0
+
+MAE = mean_absolute_error(ytest_f, out_f)
+print("MAE: ",MAE)
+
+
+#MAPE (Mean Absolute Percentage Error)
+
+def percentage_error(actual, predicted):
+    res = np.empty(actual.shape)
+    for j in range(actual.shape[0]):
+        if actual[j] != 0:
+            res[j] = (actual[j] - predicted[j]) / actual[j]
+        else:
+            res[j] = predicted[j] / np.mean(actual)
+    return res
+
+def mean_absolute_percentage_error(y_true, y_pred): 
+    return np.mean(np.abs(percentage_error(np.asarray(y_true), np.asarray(y_pred)))) * 100
+
+MAPE = mean_absolute_percentage_error(ytest_f, out_f)
+print("MAPE:", MAPE)
+
+
+#RMSE (Root Mean Squared Error)
+
+from sklearn.metrics import mean_squared_error
+
+#squaredboolean value, optional (default = True), If True returns MSE value, if False returns RMSE value.
+#Best value is 0.0
+
+RMSE = mean_squared_error(ytest_f, out_f, squared=False)
+print("RMSE: ",RMSE)
+
+
+
